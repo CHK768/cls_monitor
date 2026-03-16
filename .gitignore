@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# Chrome 驱动缓存
+.wdm/
+.cls_monitor_chrome/
+
+# 配置文件（含敏感路径，不上传）
+.cls_monitor_config.json
+
+# Excel 数据文件
+*.xlsx
+
+# macOS
+.DS_Store
