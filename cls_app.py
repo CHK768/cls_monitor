@@ -1092,6 +1092,62 @@ class _CloseButton(_IconButton):
         p.drawLine(int(s - m), int(m), int(m), int(s - m))
 
 
+class _AddButton(QPushButton):
+    """
+    蓝底白色加号圆角正方形按钮，用 QPainter 绘制保证 + 完全居中。
+    """
+    _SIZE   = 20
+    _RADIUS = 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._SIZE, self._SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pressed = False
+        self._hovered = False
+
+    def enterEvent(self, e):
+        self._hovered = True;  self.update();  super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hovered = False; self.update();  super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        self._pressed = True;  self.update();  super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._pressed = False; self.update();  super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _):
+        from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self._SIZE
+
+        # 背景色
+        if self._pressed:
+            bg = QColor("#0055BB")
+        elif self._hovered:
+            bg = QColor("#0066DD")
+        else:
+            bg = QColor(COLOR_ACCENT)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(0, 0, s, s, self._RADIUS, self._RADIUS)
+
+        # 白色加号，居中
+        arm   = s * 0.28        # 横/竖臂半长
+        cx    = s / 2
+        cy    = s / 2
+        thick = 2.0
+        pen = QPen(QColor("#FFFFFF"), thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(int(cx - arm), int(cy), int(cx + arm), int(cy))
+        p.drawLine(int(cx), int(cy - arm), int(cx), int(cy + arm))
+        p.end()
+
+
 def _apply_macos_vibrancy(widget: "QWidget") -> bool:
     """
     通过 ctypes 调用 Objective-C runtime，将 macOS NSVisualEffectView
@@ -2244,26 +2300,8 @@ class MainWindow(QMainWindow):
         codes_raw = row_dict.get("股票代码", "")
         codes = [c.strip() for c in codes_raw.split("\n") if c.strip()] if codes_raw else []
         if codes:
-            btn = QPushButton("+")
+            btn = _AddButton()
             btn.setToolTip("添加到报价栏")
-            btn.setFixedSize(26, 26)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {COLOR_ACCENT};
-                    color: #FFFFFF;
-                    border: none;
-                    border-radius: 7px;
-                    font-size: 16px;
-                    font-weight: 300;
-                    padding: 0;
-                }}
-                QPushButton:hover {{
-                    background-color: #0066DD;
-                }}
-                QPushButton:pressed {{
-                    background-color: #0055BB;
-                }}
-            """)
             def make_adder(c_list):
                 def add():
                     self._add_codes_to_watchbar(c_list)
