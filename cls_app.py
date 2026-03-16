@@ -1141,10 +1141,11 @@ class _AddButton(QPushButton):
         cx    = s / 2
         cy    = s / 2
         thick = 2.0
+        from PyQt6.QtCore import QPointF
         pen = QPen(QColor("#FFFFFF"), thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
-        p.drawLine(int(cx - arm), int(cy), int(cx + arm), int(cy))
-        p.drawLine(int(cx), int(cy - arm), int(cx), int(cy + arm))
+        p.drawLine(QPointF(cx - arm, cy), QPointF(cx + arm, cy))
+        p.drawLine(QPointF(cx, cy - arm), QPointF(cx, cy + arm))
         p.end()
 
 
@@ -1827,6 +1828,7 @@ class MainWindow(QMainWindow):
         )
 
         outer.addWidget(self.quote_input)
+        outer.addSpacing(12)
 
         # 可横向滚动的报价区域
         scroll = QScrollArea()
@@ -1935,12 +1937,13 @@ class MainWindow(QMainWindow):
     def _add_quote_chip(self, code: str):
         """在报价栏添加一个股票 chip（先占位，等数据回来再更新）"""
         chip = QFrame()
+        chip.setObjectName("quote_chip")
         chip.setStyleSheet(
-            f"background-color: {COLOR_ELEVATED}; border: 1px solid {COLOR_BORDER};"
-            f"border-radius: 8px;"
+            "QFrame#quote_chip { background-color: #F4F4F4;"
+            "border: none; border-radius: 12px; }"
         )
         chip_layout = QHBoxLayout(chip)
-        chip_layout.setContentsMargins(8, 0, 6, 0)
+        chip_layout.setContentsMargins(10, 0, 6, 0)
         chip_layout.setSpacing(4)
 
         lbl = QLabel(f"{code}  --")
@@ -2019,14 +2022,16 @@ class MainWindow(QMainWindow):
             try:
                 pct_f = float(pct)
                 sign  = "▲" if pct_f >= 0 else "▼"
-                color = COLOR_RED if pct_f >= 0 else COLOR_GREEN  # A股红涨绿跌
+                text_color = COLOR_RED if pct_f >= 0 else COLOR_GREEN  # A股红涨绿跌
                 pct_str = f"{sign}{abs(pct_f):.2f}%"
             except Exception:
-                color = COLOR_MUTED
+                text_color = COLOR_MUTED
                 pct_str = "--"
             name = q.get("name", code)
             lbl.setText(f"{name}  ¥{price}  {pct_str}")
-            lbl.setStyleSheet(f"color: {color}; font-size: 12px; border: none; font-weight: bold;")
+            lbl.setStyleSheet(
+                f"color: {text_color}; font-size: 12px; border: none; font-weight: bold;"
+            )
         # 同步到桌面小组件
         self._desktop_widget.update_quotes(results)
 
