@@ -1137,7 +1137,7 @@ class _AddButton(QPushButton):
         p.drawRoundedRect(0, 0, s, s, self._RADIUS, self._RADIUS)
 
         # 白色加号，居中
-        arm   = s * 0.28        # 横/竖臂半长
+        arm   = s * 0.18        # 横/竖臂半长
         cx    = s / 2
         cy    = s / 2
         thick = 2.0
