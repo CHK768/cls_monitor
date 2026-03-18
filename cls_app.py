@@ -527,6 +527,20 @@ def job(config: dict, log_fn=None, row_fn=None):
 
 def _market_prefix(code: str) -> str:
     """根据代码判断交易所前缀：sh=沪，sz=深"""
+    # 沪市指数：000xxx / 000xxx 段中属于上交所的指数代码
+    _SH_INDICES = {
+        "000001",  # 上证指数
+        "000016",  # 上证50
+        "000300",  # 沪深300
+        "000905",  # 中证500
+        "000852",  # 中证1000
+        "000010",  # 上证180
+        "000688",  # 科创50
+        "000906",  # 中证800
+        "000985",  # 中证全指
+    }
+    if code in _SH_INDICES:
+        return "sh"
     return "sh" if code.startswith("6") else "sz"
 
 
@@ -602,12 +616,33 @@ class QuoteFetchThread(QThread):
 class StockListLoader(QThread):
     loaded = pyqtSignal(list)   # list[dict]: code/name/pinyin
 
+    # 主要指数（手动维护，不依赖 akshare 接口）
+    _INDICES = [
+        ("000001", "上证指数"),
+        ("000016", "上证50"),
+        ("000300", "沪深300"),
+        ("000905", "中证500"),
+        ("000852", "中证1000"),
+        ("000688", "科创50"),
+        ("000906", "中证800"),
+        ("399001", "深证成指"),
+        ("399006", "创业板指"),
+        ("399005", "中小100"),
+        ("399300", "沪深300"),
+    ]
+
     def run(self):
         try:
             import akshare as ak
             from pypinyin import lazy_pinyin, Style
             df = ak.stock_info_a_code_name()
             result = []
+
+            # 先插入指数，确保搜索时排在前面
+            for code, name in self._INDICES:
+                initials = "".join(lazy_pinyin(name, style=Style.FIRST_LETTER))
+                result.append({"code": code, "name": name, "pinyin": initials.lower()})
+
             for _, row in df.iterrows():
                 name = str(row["name"]).replace(" ", "")
                 initials = "".join(lazy_pinyin(name, style=Style.FIRST_LETTER))
