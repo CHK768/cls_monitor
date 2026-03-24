@@ -34,11 +34,12 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QSpinBox, QAbstractSpinBox, QLineEdit, QPushButton, QTextEdit,
     QTableWidget, QTableWidgetItem, QTabWidget, QFileDialog,
     QHeaderView, QSplitter, QStatusBar, QFrame, QListWidget,
+    QGraphicsOpacityEffect,
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize,
+    Qt, QThread, pyqtSignal, QTimer, QSize, QPoint,
 )
-from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor, QClipboard
+from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor, QClipboard, QPixmap
 
 
 # ──────────────────────────────────────────
@@ -1184,6 +1185,89 @@ class _AddButton(QPushButton):
         p.end()
 
 
+def _native_window_drag(widget: "QWidget") -> bool:
+    """
+    调用 macOS 原生 performWindowDragWithEvent: 开始拖动窗口。
+    必须在 mousePressEvent 中同步调用（此时 currentEvent 仍是 mouseDown 事件）。
+    """
+    import sys
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes, ctypes.util
+        libobjc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        libobjc.sel_registerName.restype  = ctypes.c_void_p
+        libobjc.objc_getClass.restype     = ctypes.c_void_p
+        libobjc.objc_msgSend.restype      = ctypes.c_void_p
+        libobjc.objc_msgSend.argtypes     = [ctypes.c_void_p, ctypes.c_void_p]
+
+        def sel(name):
+            return ctypes.c_void_p(libobjc.sel_registerName(name.encode()))
+
+        def msg(obj, s, *args):
+            libobjc.objc_msgSend.restype  = ctypes.c_void_p
+            libobjc.objc_msgSend.argtypes = (
+                [ctypes.c_void_p, ctypes.c_void_p]
+                + [ctypes.c_void_p] * len(args)
+            )
+            return libobjc.objc_msgSend(obj, s, *args)
+
+        # 获取 NSWindow
+        qt_view = ctypes.c_void_p(int(widget.winId()))
+        ns_win  = ctypes.c_void_p(msg(qt_view, sel("window")))
+
+        # 获取当前 NSEvent（mouseDown 事件，此刻仍在事件队列顶端）
+        ns_app_cls = ctypes.c_void_p(libobjc.objc_getClass(b"NSApplication"))
+        ns_app     = ctypes.c_void_p(msg(ns_app_cls, sel("sharedApplication")))
+        ns_event   = ctypes.c_void_p(msg(ns_app, sel("currentEvent")))
+
+        # 启动原生窗口拖动（内部运行 modal run loop 直到鼠标释放）
+        libobjc.objc_msgSend.restype  = None
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        libobjc.objc_msgSend(ns_win, sel("performWindowDragWithEvent:"), ns_event)
+        return True
+    except Exception:
+        return False
+
+
+class _DragHandle(QWidget):
+    """
+    可拖动标题栏。
+    - macOS：调用 performWindowDragWithEvent: 原生拖动（QLabel 不消费事件，
+      会向上传播到此处，按钮消费事件故不传播，自然豁免）
+    - 其他平台：记录鼠标偏移量，在 mouseMoveEvent 中调用 move()
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        import sys
+        if sys.platform == "darwin":
+            _native_window_drag(self.window())
+            w = self.window()
+            if hasattr(w, "_save_position"):
+                w._save_position()
+        else:
+            self._drag_pos = (
+                event.globalPosition().toPoint()
+                - self.window().frameGeometry().topLeft()
+            )
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        w = self.window()
+        if hasattr(w, "_save_position"):
+            w._save_position()
+
+
 def _apply_macos_vibrancy(widget: "QWidget") -> bool:
     """
     通过 ctypes 调用 Objective-C runtime，将 macOS NSVisualEffectView
@@ -1276,6 +1360,9 @@ def _apply_macos_vibrancy(widget: "QWidget") -> bool:
         libobjc.objc_msgSend.restype  = None
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
         libobjc.objc_msgSend(ns_win, sel("setHidesOnDeactivate:"), False)
+
+        # ── 允许通过拖动窗口背景移动窗口 ──
+        libobjc.objc_msgSend(ns_win, sel("setMovableByWindowBackground:"), True)
 
         # ── 提升窗口层级到 NSFloatingWindowLevel(3) ──
         # 确保在所有普通 App 窗口上方持续可见
@@ -1402,6 +1489,7 @@ def _fix_widget_float(widget: "QWidget", pinned: bool = True) -> None:
         libobjc.objc_msgSend.restype  = None
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
         libobjc.objc_msgSend(ns_win, sel("setHidesOnDeactivate:"), not pinned)
+        libobjc.objc_msgSend(ns_win, sel("setMovableByWindowBackground:"), True)
 
         # setCollectionBehavior: pinned=81(canJoinAllSpaces|stationary|ignoresCycle), unpinned=0(default)
         behavior = ctypes.c_ulong(81 if pinned else 0)
@@ -1481,8 +1569,8 @@ class DesktopWidget(QWidget):
         main.setContentsMargins(0, 0, 0, 0)
         main.setSpacing(0)
 
-        # ── 标题栏
-        title_bar = QWidget()
+        # ── 标题栏（_DragHandle 使标题区域整体可拖动）
+        title_bar = _DragHandle()
         title_bar.setFixedHeight(36)
         title_bar.setObjectName("wdg_title")
         title_bar.setStyleSheet(f"""
@@ -1699,6 +1787,124 @@ class DesktopWidget(QWidget):
             from PyQt6.QtWidgets import QApplication as _App
             screen = _App.primaryScreen().geometry()
             self.move(screen.width() - 340, screen.height() - 420)
+
+
+# ──────────────────────────────────────────
+# 报价栏可拖拽 Chip
+# ──────────────────────────────────────────
+
+class _DraggableChip(QFrame):
+    """
+    报价栏股票 chip，支持横向拖拽排序。
+    拖拽时鼠标变为抓手，释放后调用 save_order_cb() 保存新顺序。
+    """
+
+    def __init__(self, code: str, save_order_cb, parent=None):
+        super().__init__(parent)
+        self.code = code
+        self._save_order = save_order_cb
+        self._drag_start_x: float | None = None
+        self._dragging = False
+        self._ghost: QLabel | None = None
+        self._ghost_offset = QPoint(0, 0)
+        self.setObjectName("quote_chip")
+        self.setStyleSheet(
+            "QFrame#quote_chip { background-color: #F4F4F4;"
+            "border: none; border-radius: 12px; }"
+        )
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_x = event.position().x()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and self._drag_start_x is not None):
+            dx = event.position().x() - self._drag_start_x
+            if not self._dragging and abs(dx) > 6:
+                self._dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._start_ghost(event.globalPosition().toPoint())
+            if self._dragging:
+                self._move_ghost(event.globalPosition().toPoint())
+                self._try_swap(event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._end_ghost()
+            self._save_order()
+        self._drag_start_x = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _start_ghost(self, global_pos: QPoint):
+        """创建半透明截图跟随鼠标，原 chip 变虚。"""
+        pixmap = self.grab()
+        ghost = QLabel(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        ghost.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        ghost.setPixmap(pixmap)
+        ghost.resize(pixmap.size())
+        ghost.setWindowOpacity(0.75)
+        ghost.show()
+        self._ghost = ghost
+        self._ghost_offset = QPoint(self.width() // 2, self.height() // 2)
+        self._move_ghost(global_pos)
+        # 原 chip 半透明
+        fx = QGraphicsOpacityEffect()
+        fx.setOpacity(0.35)
+        self.setGraphicsEffect(fx)
+
+    def _move_ghost(self, global_pos: QPoint):
+        if self._ghost:
+            self._ghost.move(global_pos - self._ghost_offset)
+
+    def _end_ghost(self):
+        if self._ghost:
+            self._ghost.close()
+            self._ghost.deleteLater()
+            self._ghost = None
+        self.setGraphicsEffect(None)
+
+    def _try_swap(self, global_pos):
+        container = self.parent()
+        if container is None:
+            return
+        layout = container.layout()
+        if layout is None:
+            return
+        local_x = container.mapFromGlobal(global_pos).x()
+        n = layout.count() - 1  # 最后一项是 stretch，排除
+        my_idx = -1
+        for i in range(n):
+            item = layout.itemAt(i)
+            if item and item.widget() is self:
+                my_idx = i
+                break
+        if my_idx == -1:
+            return
+        # 尝试与左侧 chip 交换
+        if my_idx > 0:
+            lw = layout.itemAt(my_idx - 1).widget()
+            if lw and local_x < lw.x() + lw.width() * 0.5:
+                layout.removeWidget(self)
+                layout.insertWidget(my_idx - 1, self)
+                return
+        # 尝试与右侧 chip 交换
+        if my_idx < n - 1:
+            rw = layout.itemAt(my_idx + 1).widget()
+            if rw and local_x > rw.x() + rw.width() * 0.5:
+                layout.removeWidget(self)
+                layout.insertWidget(my_idx + 1, self)
 
 
 # ──────────────────────────────────────────
@@ -1969,14 +2175,21 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage("未找到匹配股票，请输入6位代码", 2000)
 
+    def _save_watch_order(self):
+        """从 layout 当前顺序重建 watch_codes 并保存。"""
+        n = self._quote_row.count() - 1  # 最后是 stretch
+        codes = []
+        for i in range(n):
+            item = self._quote_row.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, _DraggableChip):
+                codes.append(w.code)
+        self.config["watch_codes"] = codes
+        ConfigManager.save(self.config)
+
     def _add_quote_chip(self, code: str):
         """在报价栏添加一个股票 chip（先占位，等数据回来再更新）"""
-        chip = QFrame()
-        chip.setObjectName("quote_chip")
-        chip.setStyleSheet(
-            "QFrame#quote_chip { background-color: #F4F4F4;"
-            "border: none; border-radius: 12px; }"
-        )
+        chip = _DraggableChip(code, self._save_watch_order)
         chip_layout = QHBoxLayout(chip)
         chip_layout.setContentsMargins(10, 0, 6, 0)
         chip_layout.setSpacing(4)
@@ -1991,6 +2204,7 @@ class MainWindow(QMainWindow):
             f"background: transparent; color: {COLOR_MUTED}; border: none;"
             f"font-size: 13px; padding: 0;"
         )
+        btn_close.setCursor(Qt.CursorShape.ArrowCursor)
         def make_remover(c):
             def remove():
                 self._remove_watch_code(c)
