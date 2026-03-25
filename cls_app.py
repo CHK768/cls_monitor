@@ -225,9 +225,43 @@ def build_driver(config: dict) -> webdriver.Chrome:
     if chrome_bin and Path(chrome_bin).exists():
         opts.binary_location = chrome_bin
     return webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
+        service=Service(_get_chromedriver()),
         options=opts,
     )
+
+
+def _get_chromedriver() -> str:
+    """
+    获取可用的 chromedriver 路径。
+    优先用 ChromeDriverManager 下载/定位，若启动后立即被系统杀掉（exit -9/137），
+    则从本地缓存中找到能正常运行的版本。
+    """
+    import subprocess as _sp
+    import glob as _glob
+
+    def _is_working(path: str) -> bool:
+        try:
+            r = _sp.run([path, "--version"], capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # 先尝试 webdriver-manager 推荐版本
+    try:
+        path = ChromeDriverManager().install()
+        if _is_working(path):
+            return path
+    except Exception:
+        pass
+
+    # 回退：扫描本地缓存，找第一个可用的
+    cache_pattern = str(Path.home() / ".wdm/drivers/chromedriver/mac64/*/chromedriver-mac-arm64/chromedriver")
+    candidates = sorted(_glob.glob(cache_pattern), reverse=True)  # 版本号降序
+    for path in candidates:
+        if _is_working(path):
+            return path
+
+    raise RuntimeError("未找到可用的 chromedriver，请检查 Chrome 安装或网络连接")
 
 
 def parse_page(driver: webdriver.Chrome, log_fn=None) -> list[dict]:
