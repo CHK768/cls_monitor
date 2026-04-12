@@ -12,6 +12,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -24,22 +27,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          pip install pyinstaller pillow
           pip install -r requirements.txt
+
+      - name: Generate icon
+        run: python create_icon.py
 
       - name: Build Windows executable
         run: |
           pyinstaller --onefile --windowed `
             --name "财联社监控" `
             --icon=assets/icon.ico `
-            --add-data "assets;assets" `
+            --clean --noconfirm `
             cls_app.py
 
       - name: Create Windows zip
         run: |
-          cd dist
-          7z a "../财联社监控-Windows.zip" "财联社监控.exe"
-          cd ..
+          Compress-Archive -Path "dist/财联社监控.exe" -DestinationPath "财联社监控-Windows.zip"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -61,34 +65,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          pip install pyinstaller pillow
           pip install -r requirements.txt
+
+      - name: Generate icon
+        run: python create_icon.py
 
       - name: Build macOS app
         run: |
           pyinstaller --windowed \
             --name "财联社监控" \
-            --icon=assets/icon.icns \
-            --add-data "assets:assets" \
+            --clean --noconfirm \
             cls_app.py
 
-      - name: Create macOS dmg
+      - name: Create macOS zip
         run: |
-          brew install create-dmg || true
-          create-dmg \
-            --volname "财联社监控" \
-            --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 100 \
-            --app-drop-link 450 185 \
-            "财联社监控-macOS.dmg" \
-            "dist/财联社监控.app"
+          # 由于 create-dmg 经常失败，直接打包为 zip
+          cd dist
+          zip -r "../财联社监控-macOS.zip" "财联社监控.app"
+          cd ..
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-build
-          path: 财联社监控-macOS.dmg
+          path: 财联社监控-macOS.zip
 
   create-release:
     needs: [build-windows, build-macos]
@@ -104,8 +105,9 @@ jobs:
         with:
           files: |
             artifacts/windows-build/*.zip
-            artifacts/macos-build/*.dmg
+            artifacts/macos-build/*.zip
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
