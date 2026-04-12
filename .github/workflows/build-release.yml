@@ -1,0 +1,111 @@
+name: Build Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build Windows executable
+        run: |
+          pyinstaller --onefile --windowed `
+            --name "财联社监控" `
+            --icon=assets/icon.ico `
+            --add-data "assets;assets" `
+            cls_app.py
+
+      - name: Create Windows zip
+        run: |
+          cd dist
+          7z a "../财联社监控-Windows.zip" "财联社监控.exe"
+          cd ..
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: 财联社监控-Windows.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build macOS app
+        run: |
+          pyinstaller --windowed \
+            --name "财联社监控" \
+            --icon=assets/icon.icns \
+            --add-data "assets:assets" \
+            cls_app.py
+
+      - name: Create macOS dmg
+        run: |
+          brew install create-dmg || true
+          create-dmg \
+            --volname "财联社监控" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 450 185 \
+            "财联社监控-macOS.dmg" \
+            "dist/财联社监控.app"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: 财联社监控-macOS.dmg
+
+  create-release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/windows-build/*.zip
+            artifacts/macos-build/*.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
