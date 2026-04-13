@@ -28,7 +28,7 @@ jobs:
 
       - name: Build Windows EXE
         run: |
-          pyinstaller --onefile --windowed --name "财联社监控" cls_app.py
+          pyinstaller --onefile --windowed --name "cls_monitor" cls_app.py
 
       - name: Get upload URL
         id: release_info
@@ -41,16 +41,14 @@ jobs:
           fi
           RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
-          UPLOAD_URL=$(echo "$RESPONSE" | python -c "import json,sys; d=json.load(sys.stdin); print(d['upload_url'].split('{')[0])")
-          RELEASE_ID=$(echo "$RESPONSE" | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          UPLOAD_URL=$(echo "$RESPONSE" | python -c "import json,sys; print(json.load(sys.stdin)['upload_url'].split('{')[0])")
           echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
-          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
 
-      - name: Upload Windows EXE to Release
+      - name: Upload Windows EXE
         shell: bash
         run: |
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/octet-stream" \
-            "${{ steps.release_info.outputs.upload_url }}?name=%E8%B4%A2%E8%81%94%E7%A4%BE%E7%9B%91%E6%8E%A7_Windows.exe&label=%E8%B4%A2%E8%81%94%E7%A4%BE%E7%9B%91%E6%8E%A7_Windows.exe" \
-            --data-binary @"./dist/财联社监控.exe"
+            "${{ steps.release_info.outputs.upload_url }}?name=cls_monitor_Windows.exe" \
+            --data-binary @"./dist/cls_monitor.exe"
