@@ -596,6 +596,9 @@ def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None, emi
     st_empty = df["相关股票"].isna()   | (df["相关股票"].fillna("") == "")
     # 未分析，或之前分析失败（有时间戳但内容全空）
     mask = t_empty | (ai_empty & st_empty)
+    # 若指定了 emit_ids，只分析本次新抓取的条目，旧数据跳过
+    if emit_ids is not None:
+        mask = mask & df["ID"].isin(emit_ids)
     indices = df.index[mask].tolist()
 
     if not indices:
