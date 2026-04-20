@@ -589,7 +589,7 @@ def save_to_excel(df: pd.DataFrame, path: Path, added: int, total: int, log_fn=N
         log_fn(msg, "normal")
 
 
-def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None) -> pd.DataFrame:
+def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None, emit_ids=None) -> pd.DataFrame:
     """AI 批量分析；row_fn(row_dict) 每条分析完后回调（用于实时 emit）"""
     t_empty  = df["AI分析时间"].isna() | (df["AI分析时间"].fillna("") == "")
     ai_empty = df["AI分析"].isna()     | (df["AI分析"].fillna("") == "")
@@ -646,10 +646,11 @@ def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None) -> 
                 level,
             )
 
-        # 实时回调
+        # 实时回调（仅限本次新抓取的条目）
         if row_fn:
             updated = df.loc[idx].to_dict()
-            row_fn([updated])
+            if emit_ids is None or updated.get("ID") in emit_ids:
+                row_fn([updated])
 
         time.sleep(22)   # KIMI 免费版约 3 RPM，需 ~20s 间隔
 
@@ -681,6 +682,9 @@ def job(config: dict, log_fn=None, row_fn=None):
         new_df = pd.DataFrame(new_items)
         old_df = load_existing(excel_path, log_fn)
 
+        old_ids: set = set(old_df["ID"].dropna()) if not old_df.empty and "ID" in old_df.columns else set()
+        truly_new_ids: set = set(new_df["ID"].dropna()) - old_ids
+
         if old_df.empty:
             combined = new_df.copy()
         else:
@@ -690,8 +694,9 @@ def job(config: dict, log_fn=None, row_fn=None):
             combined = pd.concat([old_df, new_df], ignore_index=True)
             combined.drop_duplicates(subset=["ID"], keep="first", inplace=True)
 
-        added = len(new_df)
-        combined = enrich_with_ai(combined, config, log_fn, row_fn)
+        added = len(truly_new_ids)
+        # 只对真正新的条目触发 row_fn（不弹旧数据）
+        combined = enrich_with_ai(combined, config, log_fn, row_fn, emit_ids=truly_new_ids)
 
         if "发布时间" in combined.columns:
             combined.sort_values("发布时间", ascending=False, inplace=True, ignore_index=True)
@@ -2518,6 +2523,7 @@ class MainWindow(QMainWindow):
         self._countdown_timer.timeout.connect(self._tick_countdown)
         self._countdown_secs = 0
         self._is_running = False
+        self._table_ids: set[str] = set()   # 已插入表格的 ID，防重复
         self._quote_thread: QuoteFetchThread | None = None
         self._quote_timer = QTimer(self)
         self._quote_timer.timeout.connect(self._refresh_quotes)
@@ -3159,19 +3165,27 @@ class MainWindow(QMainWindow):
             import traceback; traceback.print_exc()
 
     def _on_new_data(self, rows: list):
+        inserted = []
         try:
-            # 关闭排序，批量插入后再重新排序（避免插入中途乱序）
             self.table.setSortingEnabled(False)
             for row_dict in rows:
+                rid = str(row_dict.get("ID", ""))
+                if rid and rid in self._table_ids:
+                    continue
                 self._insert_table_row(row_dict)
+                if rid:
+                    self._table_ids.add(rid)
+                inserted.append(row_dict)
             self.table.setSortingEnabled(True)
             self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
-            self.tabs.setCurrentIndex(1)
+            if inserted:
+                self.tabs.setCurrentIndex(1)
         except Exception:
             import traceback; traceback.print_exc()
-        # 同步到桌面小组件
+        # 同步到桌面小组件（仅真正新插入的）
         try:
-            self._desktop_widget.update_news(rows)
+            if inserted:
+                self._desktop_widget.update_news(inserted)
         except Exception:
             import traceback; traceback.print_exc()
 
