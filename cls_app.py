@@ -2292,7 +2292,9 @@ class DesktopWidget(QWidget):
             _t = item.get("标题") or item.get("内容") or ""
             title  = str(_t)[:28] if _t == _t else ""  # guard against NaN
             raw_t  = item.get("发布时间", "")
-            t_str  = str(raw_t)[-5:] if raw_t and raw_t == raw_t else ""
+            _rt = str(raw_t) if raw_t and raw_t == raw_t else ""
+            _m  = re.search(r"(\d{2}:\d{2})", _rt)
+            t_str = _m.group(1) if _m else ""
 
             if "↑" in stocks and "↓" not in stocks:
                 c, icon = self._C_GREEN, "↑"
