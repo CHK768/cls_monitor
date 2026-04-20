@@ -32,7 +32,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QSpinBox, QAbstractSpinBox, QLineEdit, QPushButton, QTextEdit,
-    QTableWidget, QTableWidgetItem, QTabWidget, QFileDialog,
+    QTableWidget, QTableWidgetItem, QTabWidget, QFileDialog, QDialog, QComboBox,
     QHeaderView, QSplitter, QStatusBar, QFrame, QListWidget,
     QGraphicsOpacityEffect,
 )
@@ -47,6 +47,10 @@ from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor, QClipboard,
 # ──────────────────────────────────────────
 
 URL = "https://www.cls.cn/telegraph"
+
+
+class _RateLimitError(Exception):
+    """API 速率限制异常，用于中断批量分析"""
 
 COLUMNS = [
     "ID", "发布时间", "标题", "内容",
@@ -80,6 +84,11 @@ DEFAULTS = {
     "chrome_bin": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "watch_codes": [],   # 自选股代码列表
     "quote_refresh_secs": 30,  # 报价刷新间隔（秒）
+    # AI 提供商配置
+    "ai_provider": "claude_cli",   # claude_cli / claude_api / openai / gemini / kimi / qwen / custom
+    "ai_api_key": "",
+    "ai_model": "",
+    "ai_base_url": "",
 }
 
 QUOTE_REFRESH_SECS = 30  # 报价刷新间隔（秒）
@@ -338,16 +347,12 @@ def fetch_items(driver: webdriver.Chrome, config: dict, log_fn=None) -> list[dic
     return parse_page(driver, log_fn)
 
 
-def analyze_news(title: str, body: str, config: dict, log_fn=None) -> dict | None:
-    news_text = f"{title}{body}".strip()
-    if not news_text:
-        return None
-
+def _analyze_with_claude_cli(news_text: str, config: dict, log_fn=None) -> dict | None:
+    """使用 Claude CLI 分析新闻"""
     claude_bin = config.get("claude_bin", "") or "claude"
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
 
-    # 确保 claude_bin 所在目录在 PATH 中
     bin_dir = str(Path(claude_bin).parent)
     current_path = env.get("PATH", "")
     if bin_dir not in current_path:
@@ -362,21 +367,16 @@ def analyze_news(title: str, body: str, config: dict, log_fn=None) -> dict | Non
             timeout=60,
             env=env,
         )
-
         if result.returncode != 0:
             if log_fn:
                 log_fn(f"[{now()}] CLI 错误: {result.stderr[:100]}", "error")
             return None
-
         outer = json.loads(result.stdout)
         raw = outer.get("result", "")
-
         json_match = re.search(r"\{[\s\S]+\}", raw)
         if not json_match:
             return None
-
         return json.loads(json_match.group())
-
     except subprocess.TimeoutExpired:
         if log_fn:
             log_fn(f"[{now()}] AI 分析超时，跳过", "error")
@@ -389,6 +389,146 @@ def analyze_news(title: str, body: str, config: dict, log_fn=None) -> dict | Non
         if log_fn:
             log_fn(f"[{now()}] AI 分析异常: {e}", "error")
         return None
+
+
+# AI 提供商默认参数
+_AI_PROVIDER_DEFAULTS = {
+    "claude_cli":  {"base_url": "",                                                   "model": ""},
+    "claude_api":  {"base_url": "https://api.anthropic.com",                          "model": "claude-3-5-sonnet-20241022"},
+    "openai":      {"base_url": "https://api.openai.com/v1",                          "model": "gpt-4o-mini"},
+    "gemini":      {"base_url": "",                                                   "model": "gemini-1.5-flash"},
+    "kimi":        {"base_url": "https://api.moonshot.cn/v1",                         "model": "moonshot-v1-8k"},
+    "qwen":        {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",  "model": "qwen-turbo"},
+    "custom":      {"base_url": "",                                                   "model": ""},
+}
+
+
+def _analyze_with_api(news_text: str, config: dict, log_fn=None) -> dict | None:
+    """通过 HTTP API 调用 AI（支持 OpenAI 兼容格式、Gemini、Anthropic Claude API）"""
+    import requests as _req
+    provider = config.get("ai_provider", "openai")
+    api_key  = config.get("ai_api_key", "")
+    model    = config.get("ai_model", "") or _AI_PROVIDER_DEFAULTS.get(provider, {}).get("model", "")
+    base_url = config.get("ai_base_url", "") or _AI_PROVIDER_DEFAULTS.get(provider, {}).get("base_url", "")
+
+    try:
+        if provider == "gemini":
+            # Google Gemini REST API
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model or 'gemini-1.5-flash'}:generateContent?key={api_key}"
+            )
+            data = {
+                "contents": [{"parts": [{"text": AI_PROMPT + "\n\n" + news_text}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 1024,
+                    "responseMimeType": "application/json",  # 强制 JSON 输出
+                },
+            }
+            r = _req.post(url, json=data, timeout=60)
+            r.raise_for_status()
+            content = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+        elif provider == "claude_api":
+            # Anthropic Claude API
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": model or "claude-3-5-sonnet-20241022",
+                "max_tokens": 1024,
+                "system": AI_PROMPT,
+                "messages": [{"role": "user", "content": news_text}],
+            }
+            url = base_url.rstrip("/") + "/v1/messages"
+            r = _req.post(url, headers=headers, json=data, timeout=60)
+            r.raise_for_status()
+            content = r.json()["content"][0]["text"]
+
+        else:
+            # OpenAI 兼容格式（openai / kimi / qwen / custom）
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "messages": [
+                    {"role": "system", "content": AI_PROMPT},
+                    {"role": "user", "content": news_text},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},  # 强制 JSON 输出
+            }
+            if model:
+                data["model"] = model
+            url = base_url.rstrip("/") + "/chat/completions"
+            r = _req.post(url, headers=headers, json=data, timeout=60)
+            # 若提供商不支持 response_format，降级重试
+            if r.status_code in (400, 422):
+                data.pop("response_format", None)
+                r = _req.post(url, headers=headers, json=data, timeout=60)
+            # 429 限流：等待后重试一次
+            if r.status_code == 429:
+                if log_fn:
+                    log_fn(f"[{now()}] 触发限流(429)，等待 60 秒后重试...", "error")
+                time.sleep(60)
+                r = _req.post(url, headers=headers, json=data, timeout=60)
+                if r.status_code == 429:
+                    raise _RateLimitError("API 速率限制持续，本批分析已暂停")
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+
+        # 打印原始回复（调试用）
+        if log_fn:
+            log_fn(f"  [API 原始回复] {content[:300]}", "normal")
+
+        # 去除 markdown 代码块（```json ... ``` 或 ``` ... ```）
+        content = re.sub(r"```(?:json)?\s*", "", content)
+        content = re.sub(r"```", "", content).strip()
+
+        # 先尝试整体解析
+        try:
+            result = json.loads(content)
+            if log_fn:
+                log_fn(f"  [API 解析成功] stocks={len(result.get('stocks', []))} summary={str(result.get('summary',''))[:40]}", "normal")
+            return result
+        except json.JSONDecodeError:
+            pass
+
+        # 再用正则提取第一个 JSON 对象
+        json_match = re.search(r"\{[\s\S]+\}", content)
+        if not json_match:
+            if log_fn:
+                log_fn(f"[{now()}] AI 未返回有效 JSON，原始: {content[:200]}", "error")
+            return None
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            if log_fn:
+                log_fn(f"[{now()}] JSON 解析失败: {e} | 原始: {content[:200]}", "error")
+            return None
+
+    except _RateLimitError:
+        raise   # 速率限制异常向上传播，由 enrich_with_ai 处理
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[{now()}] API 调用失败: {e}", "error")
+        return None
+
+
+def analyze_news(title: str, body: str, config: dict, log_fn=None) -> dict | None:
+    news_text = f"{title}{body}".strip()
+    if not news_text:
+        return None
+
+    provider = config.get("ai_provider", "claude_cli")
+    if provider == "claude_cli":
+        return _analyze_with_claude_cli(news_text, config, log_fn)
+    else:
+        return _analyze_with_api(news_text, config, log_fn)
 
 
 def format_stocks(analysis: dict | None, analyze_all: bool) -> tuple[str, str, str]:
@@ -451,7 +591,11 @@ def save_to_excel(df: pd.DataFrame, path: Path, added: int, total: int, log_fn=N
 
 def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None) -> pd.DataFrame:
     """AI 批量分析；row_fn(row_dict) 每条分析完后回调（用于实时 emit）"""
-    mask = df["AI分析时间"].isna() | (df["AI分析时间"] == "")
+    t_empty  = df["AI分析时间"].isna() | (df["AI分析时间"].fillna("") == "")
+    ai_empty = df["AI分析"].isna()     | (df["AI分析"].fillna("") == "")
+    st_empty = df["相关股票"].isna()   | (df["相关股票"].fillna("") == "")
+    # 未分析，或之前分析失败（有时间戳但内容全空）
+    mask = t_empty | (ai_empty & st_empty)
     indices = df.index[mask].tolist()
 
     if not indices:
@@ -465,7 +609,20 @@ def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None) -> 
         row = df.loc[idx]
         title = str(row.get("标题", "") or "")
         body = str(row.get("内容", "") or "")
-        analysis = analyze_news(title, body, config, log_fn)
+        try:
+            analysis = analyze_news(title, body, config, log_fn)
+        except _RateLimitError as e:
+            if log_fn:
+                log_fn(f"[{now()}] ⚠ {e}，已分析 {i-1}/{len(indices)} 条，下次运行将继续", "error")
+            break
+
+        if analysis is None:
+            # 分析失败，不写时间戳，下次运行时重试
+            if log_fn:
+                log_fn(f"  [{i}/{len(indices)}] {(title or body)[:35]} → 分析失败，跳过", "error")
+            time.sleep(2)
+            continue
+
         names, codes, detail = format_stocks(analysis, analyze_all)
 
         df.at[idx, "相关股票"] = names
@@ -494,7 +651,7 @@ def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None) -> 
             updated = df.loc[idx].to_dict()
             row_fn([updated])
 
-        time.sleep(0.3)
+        time.sleep(22)   # KIMI 免费版约 3 RPM，需 ~20s 间隔
 
     return df
 
@@ -711,6 +868,7 @@ class ScraperThread(QThread):
 
         def log_fn(text, level="normal"):
             self.log_message.emit(str(text), level)
+            print(text, flush=True)   # 同步输出到终端，便于调试
 
         def row_fn(rows):
             self.new_data.emit(rows)
@@ -1044,6 +1202,336 @@ class _ToggleSwitch(_QCheckBox):
 
 
 # ──────────────────────────────────────────
+# AISettingsDialog — AI API 配置对话框
+# ──────────────────────────────────────────
+
+class AISettingsDialog(QDialog):
+    """AI 提供商配置对话框，支持 Claude CLI / Claude API / ChatGPT / Gemini / KIMI / QWen / 自定义"""
+
+    PROVIDERS = [
+        ("claude_cli", "Claude CLI（本地命令行）"),
+        ("claude_api", "Claude API（Anthropic）"),
+        ("openai",     "ChatGPT / OpenAI"),
+        ("gemini",     "Gemini（Google）"),
+        ("kimi",       "KIMI（月之暗面）"),
+        ("qwen",       "通义千问（阿里云）"),
+        ("custom",     "自定义（OpenAI 兼容）"),
+    ]
+
+    # 各提供商常用模型列表（用于提示）
+    PROVIDER_MODELS = {
+        "claude_api": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"],
+        "openai":     ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
+        "gemini":     ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        "kimi":       ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+        "qwen":       ["qwen-turbo", "qwen-plus", "qwen-max"],
+        "custom":     [],
+    }
+
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self._config = dict(config)
+        self._test_thread = None
+        self.setWindowTitle("AI API 设置")
+        self.setMinimumWidth(440)
+        self.setModal(True)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {COLOR_BG};
+            }}
+            QLabel {{
+                color: {COLOR_TEXT};
+            }}
+            QComboBox {{
+                background-color: {COLOR_INPUT_BG};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                padding: 6px 10px;
+                color: {COLOR_TEXT};
+                font-size: 13px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {COLOR_BG};
+                border: 1px solid {COLOR_BORDER};
+                color: {COLOR_TEXT};
+                selection-background-color: {COLOR_SEL};
+            }}
+            QLineEdit {{
+                background-color: {COLOR_INPUT_BG};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                padding: 6px 10px;
+                color: {COLOR_TEXT};
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border: 1.5px solid {COLOR_ACCENT};
+            }}
+            QPushButton {{
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                padding: 7px 14px;
+                color: {COLOR_TEXT};
+                font-size: 13px;
+                background-color: transparent;
+            }}
+            QPushButton:hover {{
+                background-color: {COLOR_SURFACE};
+            }}
+            QPushButton#btn_save_ai {{
+                background-color: {COLOR_ACCENT};
+                color: white;
+                border-color: {COLOR_ACCENT};
+                font-weight: 600;
+            }}
+            QPushButton#btn_save_ai:hover {{
+                background-color: #1A8AFF;
+                border-color: #1A8AFF;
+            }}
+        """)
+        self._build_ui()
+        self._load_from_config()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(24, 20, 24, 20)
+
+        # ── 标题
+        title_lbl = QLabel("AI API 设置")
+        title_lbl.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {COLOR_TEXT};")
+        layout.addWidget(title_lbl)
+
+        # ── 提供商选择
+        self._add_label(layout, "AI 提供商")
+        self.combo_provider = QComboBox()
+        self.combo_provider.setFixedHeight(34)
+        for key, label in self.PROVIDERS:
+            self.combo_provider.addItem(label, key)
+        self.combo_provider.currentIndexChanged.connect(self._on_provider_changed)
+        layout.addWidget(self.combo_provider)
+
+        # ── Claude CLI 路径（仅 claude_cli 显示）
+        self.row_claude_bin = self._make_row()
+        self._add_label(self.row_claude_bin.layout(), "Claude 可执行路径")
+        self.edit_claude_bin = QLineEdit()
+        self.edit_claude_bin.setFixedHeight(34)
+        self.edit_claude_bin.setPlaceholderText("例：/usr/local/bin/claude")
+        self.row_claude_bin.layout().addWidget(self.edit_claude_bin)
+        layout.addWidget(self.row_claude_bin)
+
+        # ── API Key（非 claude_cli 显示）
+        self.row_api_key = self._make_row()
+        self.lbl_api_key = QLabel("API Key")
+        self.lbl_api_key.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px; font-weight: 600;")
+        self.row_api_key.layout().addWidget(self.lbl_api_key)
+        self.edit_api_key = QLineEdit()
+        self.edit_api_key.setFixedHeight(34)
+        self.edit_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_api_key.setPlaceholderText("sk-...")
+        self.row_api_key.layout().addWidget(self.edit_api_key)
+        layout.addWidget(self.row_api_key)
+
+        # ── 模型（非 claude_cli 显示）
+        self.row_model = self._make_row()
+        self._add_label(self.row_model.layout(), "模型")
+        self.edit_model = QLineEdit()
+        self.edit_model.setFixedHeight(34)
+        self.edit_model.setPlaceholderText("留空使用默认模型")
+        self.row_model.layout().addWidget(self.edit_model)
+        self.lbl_model_hint = QLabel("")
+        self.lbl_model_hint.setStyleSheet(
+            f"color: {COLOR_MUTED}; font-size: 10px;"
+        )
+        self.lbl_model_hint.setWordWrap(True)
+        self.row_model.layout().addWidget(self.lbl_model_hint)
+        layout.addWidget(self.row_model)
+
+        # ── Base URL（custom / claude_api 显示）
+        self.row_base_url = self._make_row()
+        self._add_label(self.row_base_url.layout(), "Base URL")
+        self.edit_base_url = QLineEdit()
+        self.edit_base_url.setFixedHeight(34)
+        self.edit_base_url.setPlaceholderText("https://api.example.com/v1")
+        self.row_base_url.layout().addWidget(self.edit_base_url)
+        layout.addWidget(self.row_base_url)
+
+        # ── 按钮行
+        layout.addSpacing(4)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.btn_test = QPushButton("测试连接")
+        self.btn_test.setFixedHeight(34)
+        self.btn_test.clicked.connect(self._test_connection)
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_save = QPushButton("保存")
+        btn_save.setObjectName("btn_save_ai")
+        btn_save.setFixedHeight(34)
+        btn_save.clicked.connect(self._save_and_close)
+
+        btn_row.addWidget(self.btn_test)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def _make_row(self) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(4)
+        return w
+
+    def _add_label(self, layout, text: str):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px; font-weight: 600;")
+        layout.addWidget(lbl)
+
+    def _load_from_config(self):
+        provider = self._config.get("ai_provider", "claude_cli")
+        idx = next((i for i, (k, _) in enumerate(self.PROVIDERS) if k == provider), 0)
+        self.combo_provider.setCurrentIndex(idx)
+        self.edit_claude_bin.setText(
+            self._config.get("claude_bin", "") or ConfigManager.detect_claude_bin()
+        )
+        self.edit_api_key.setText(self._config.get("ai_api_key", ""))
+        defaults = _AI_PROVIDER_DEFAULTS.get(provider, {})
+        self.edit_model.setText(self._config.get("ai_model", "") or defaults.get("model", ""))
+        self.edit_base_url.setText(self._config.get("ai_base_url", "") or defaults.get("base_url", ""))
+        self._update_visibility(provider)
+
+    def _on_provider_changed(self, _idx: int):
+        provider = self.combo_provider.currentData()
+        defaults = _AI_PROVIDER_DEFAULTS.get(provider, {})
+        # 只在字段为空时自动填充默认值
+        if not self.edit_model.text():
+            self.edit_model.setText(defaults.get("model", ""))
+        if not self.edit_base_url.text():
+            self.edit_base_url.setText(defaults.get("base_url", ""))
+        self._update_visibility(provider)
+        self.adjustSize()
+
+    def _update_visibility(self, provider: str):
+        is_cli = (provider == "claude_cli")
+        show_base_url = provider in ("claude_api", "custom")
+        self.row_claude_bin.setVisible(is_cli)
+        self.row_api_key.setVisible(not is_cli)
+        self.row_model.setVisible(not is_cli)
+        self.row_base_url.setVisible(show_base_url)
+        # 更新模型提示
+        models = self.PROVIDER_MODELS.get(provider, [])
+        if models:
+            self.lbl_model_hint.setText("可用模型：" + "  |  ".join(models))
+        else:
+            self.lbl_model_hint.setText("")
+
+    def _build_test_config(self) -> dict:
+        cfg = dict(self._config)
+        cfg["ai_provider"] = self.combo_provider.currentData()
+        cfg["claude_bin"]  = self.edit_claude_bin.text().strip()
+        cfg["ai_api_key"]  = self.edit_api_key.text().strip()
+        cfg["ai_model"]    = self.edit_model.text().strip()
+        cfg["ai_base_url"] = self.edit_base_url.text().strip()
+        return cfg
+
+    def _test_connection(self):
+        from PyQt6.QtWidgets import QMessageBox
+        import requests as _req
+        provider = self.combo_provider.currentData()
+        if provider == "claude_cli":
+            QMessageBox.information(self, "提示", "Claude CLI 无需测试连接，保存后直接使用。")
+            return
+
+        self.btn_test.setEnabled(False)
+        self.btn_test.setText("测试中...")
+        cfg = self._build_test_config()
+
+        class _TestThread(QThread):
+            done = pyqtSignal(bool, str)
+            def __init__(self, c):
+                super().__init__()
+                self._c = c
+            def run(self):
+                import requests as _rq
+                try:
+                    prov     = self._c.get("ai_provider", "openai")
+                    api_key  = self._c.get("ai_api_key", "")
+                    model    = self._c.get("ai_model", "") or _AI_PROVIDER_DEFAULTS.get(prov, {}).get("model", "")
+                    base_url = self._c.get("ai_base_url", "") or _AI_PROVIDER_DEFAULTS.get(prov, {}).get("base_url", "")
+                    test_msg = "请回复OK"
+
+                    if prov == "gemini":
+                        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                               f"{model or 'gemini-1.5-flash'}:generateContent?key={api_key}")
+                        data = {"contents": [{"parts": [{"text": test_msg}]}],
+                                "generationConfig": {"maxOutputTokens": 20}}
+                        r = _rq.post(url, json=data, timeout=30)
+                        r.raise_for_status()
+                        content = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+                    elif prov == "claude_api":
+                        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                                   "Content-Type": "application/json"}
+                        data = {"model": model or "claude-3-5-sonnet-20241022",
+                                "max_tokens": 20,
+                                "messages": [{"role": "user", "content": test_msg}]}
+                        url = (base_url or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
+                        r = _rq.post(url, headers=headers, json=data, timeout=30)
+                        r.raise_for_status()
+                        content = r.json()["content"][0]["text"]
+
+                    else:
+                        headers = {"Authorization": f"Bearer {api_key}",
+                                   "Content-Type": "application/json"}
+                        data = {"messages": [{"role": "user", "content": test_msg}],
+                                "max_tokens": 20}
+                        if model:
+                            data["model"] = model
+                        url = base_url.rstrip("/") + "/chat/completions"
+                        r = _rq.post(url, headers=headers, json=data, timeout=30)
+                        r.raise_for_status()
+                        content = r.json()["choices"][0]["message"]["content"]
+
+                    self.done.emit(True, f"连接成功！\nAI 回复：{content.strip()[:120]}")
+                except Exception as e:
+                    msg = str(e)
+                    if "429" in msg:
+                        self.done.emit(False, "请求频率超限（429 Too Many Requests）。\nAPI Key 和模型名称正确，稍等 1-2 分钟后重试即可。")
+                    elif "401" in msg or "403" in msg:
+                        self.done.emit(False, f"认证失败（{msg[:80]}）。\n请检查 API Key 是否正确。")
+                    else:
+                        self.done.emit(False, f"连接失败：{msg}")
+
+        def on_done(ok: bool, msg: str):
+            self.btn_test.setEnabled(True)
+            self.btn_test.setText("测试连接")
+            if ok:
+                QMessageBox.information(self, "测试结果", msg)
+            else:
+                QMessageBox.warning(self, "测试失败", msg)
+
+        self._test_thread = _TestThread(cfg)
+        self._test_thread.done.connect(on_done)
+        self._test_thread.start()
+
+    def _save_and_close(self):
+        self._config = self._build_test_config()
+        self.accept()
+
+    def get_config(self) -> dict:
+        return self._config
+
+
+# ──────────────────────────────────────────
 # DesktopWidget — 桌面浮动小组件
 # ──────────────────────────────────────────
 
@@ -1300,6 +1788,68 @@ class _DragHandle(QWidget):
         w = self.window()
         if hasattr(w, "_save_position"):
             w._save_position()
+
+
+def _make_radar_logo(size: int = 20, ring: bool = False, dock: bool = False) -> "QPixmap":
+    """
+    生成红色圆角底 + 白色雷达弧线的 QPixmap logo。
+    ring=True : topbar 外圈加半透明红色细圆。
+    dock=True : Dock 图标模式，图标内缩 ~15%，外圈为纯透明圆角矩形留白。
+    """
+    from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush
+    from PyQt6.QtCore import QRectF
+
+    # topbar ring 模式：pixmap 扩大，外加半透明圆
+    ring_pad = 3 if ring else 0
+    total = size + ring_pad * 2
+    pm = QPixmap(total, total)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    if ring:
+        rpen = QPen(QColor(232, 50, 28, 55))
+        rpen.setWidthF(1.4)
+        p.setPen(rpen)
+        p.setBrush(Qt.GlobalColor.transparent)
+        m = 0.6
+        p.drawEllipse(QRectF(m, m, total - m * 2, total - m * 2))
+
+    # dock 模式：图标内缩留透明外圈（约 13% 边距）
+    if dock:
+        inset = round(size * 0.13)
+        icon_size = size - inset * 2
+        ox_off = inset
+        oy_off = inset
+    else:
+        icon_size = size
+        ox_off = ring_pad
+        oy_off = ring_pad
+
+    # 红色圆角背景
+    corner_r = max(4, icon_size * 0.18)   # dock 大图时圆角比例更大
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor("#E8321C")))
+    p.drawRoundedRect(QRectF(ox_off, oy_off, icon_size, icon_size), corner_r, corner_r)
+
+    # 白色雷达弧线
+    ox = ox_off + icon_size * 0.22
+    oy = oy_off + icon_size * 0.82
+    pen = QPen(QColor("white"))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    for r in (icon_size * 0.22, icon_size * 0.42, icon_size * 0.62):
+        pen.setWidthF(icon_size * 0.07)
+        p.setPen(pen)
+        p.drawArc(QRectF(ox - r, oy - r, r * 2, r * 2), 0 * 16, 90 * 16)
+
+    # 信号源圆点
+    dot_r = icon_size * 0.1
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor("white")))
+    p.drawEllipse(QRectF(ox - dot_r, oy - dot_r, dot_r * 2, dot_r * 2))
+
+    p.end()
+    return pm
 
 
 def _apply_macos_vibrancy(widget: "QWidget") -> bool:
@@ -1619,6 +2169,12 @@ class DesktopWidget(QWidget):
         tb.setContentsMargins(10, 0, 8, 0)
         tb.setSpacing(4)
 
+        # Logo（QPixmap 贴图，规避 WA_TranslucentBackground 下 stylesheet 失效问题）
+        logo_lbl = QLabel()
+        logo_lbl.setPixmap(_make_radar_logo(20))
+        logo_lbl.setFixedSize(20, 20)
+        logo_lbl.setStyleSheet("background: transparent; border: none;")
+
         # 运行状态指示灯
         self._dot = QLabel("●")
         self._dot.setStyleSheet(
@@ -1639,6 +2195,8 @@ class DesktopWidget(QWidget):
         btn_close.clicked.connect(self._on_close)
 
         tb.addWidget(self._dot)
+        tb.addSpacing(6)
+        tb.addWidget(logo_lbl)
         tb.addSpacing(4)
         tb.addWidget(lbl_title)
         tb.addStretch()
@@ -1731,9 +2289,10 @@ class DesktopWidget(QWidget):
         lines = []
         for item in self._news_items[:6]:
             stocks = item.get("相关股票", "")
-            title  = (item.get("标题", "") or item.get("内容", ""))[:28]
+            _t = item.get("标题") or item.get("内容") or ""
+            title  = str(_t)[:28] if _t == _t else ""  # guard against NaN
             raw_t  = item.get("发布时间", "")
-            t_str  = raw_t[-5:] if raw_t else ""
+            t_str  = str(raw_t)[-5:] if raw_t and raw_t == raw_t else ""
 
             if "↑" in stocks and "↓" not in stocks:
                 c, icon = self._C_GREEN, "↑"
@@ -2023,10 +2582,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 0, 16, 0)
         layout.setSpacing(8)
 
+        logo = QLabel()
+        logo.setPixmap(_make_radar_logo(18))
+        logo.setFixedSize(18, 18)
+
         title = QLabel("财联社监控")
         title.setStyleSheet(
             f"font-size: 15px; font-weight: 600; color: {COLOR_TEXT};"
         )
+        layout.addWidget(logo)
+        layout.addSpacing(6)
         layout.addWidget(title)
         layout.addStretch()
 
@@ -2071,6 +2636,28 @@ class MainWindow(QMainWindow):
         """)
         self.btn_widget.toggled.connect(self._toggle_desktop_widget)
         layout.addWidget(self.btn_widget)
+
+        # AI 设置按钮
+        btn_ai_settings = QPushButton("⚙ 设置")
+        btn_ai_settings.setFixedHeight(28)
+        btn_ai_settings.setToolTip("配置 AI API 提供商")
+        btn_ai_settings.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                color: {COLOR_MUTED};
+                padding: 0 12px;
+                font-size: 12px;
+                font-weight: 400;
+            }}
+            QPushButton:hover {{
+                background-color: {COLOR_SURFACE};
+                color: {COLOR_TEXT};
+            }}
+        """)
+        btn_ai_settings.clicked.connect(self._open_ai_settings)
+        layout.addWidget(btn_ai_settings)
 
         return bar
 
@@ -2258,9 +2845,13 @@ class MainWindow(QMainWindow):
         ConfigManager.save(self.config)
         lbl = self._quote_labels.pop(code, None)
         if lbl:
-            chip = lbl.parent()
-            self._quote_row.removeWidget(chip)
-            chip.deleteLater()
+            try:
+                chip = lbl.parent()
+                if chip is not None:
+                    self._quote_row.removeWidget(chip)
+                    chip.deleteLater()
+            except RuntimeError:
+                pass  # C++ 对象已被删除，忽略
 
     def _add_codes_to_watchbar(self, codes: list[str]):
         added = []
@@ -2371,20 +2962,35 @@ class MainWindow(QMainWindow):
         self.chk_ai.setChecked(True)
         self.chk_all.setChecked(self.config.get("analyze_all", True))
 
-        detected = ConfigManager.detect_claude_bin()
-        self.edit_claude = QLineEdit(self.config.get("claude_bin", "") or detected)
-        self.edit_claude.setPlaceholderText("claude 可执行路径")
+        self.lbl_ai_provider = QLabel(self._get_provider_display())
+        self.lbl_ai_provider.setStyleSheet(
+            f"color: {COLOR_MUTED}; font-size: 11px; margin-top: 4px;"
+        )
 
-        lbl_claude = QLabel("Claude 路径")
-        lbl_claude.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px; margin-top: 4px;")
+        btn_ai_cfg = QPushButton("配置 AI API")
+        btn_ai_cfg.setFixedHeight(28)
+        btn_ai_cfg.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 4px;
+                color: {COLOR_TEXT};
+                font-size: 12px;
+                padding: 0 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLOR_SURFACE};
+            }}
+        """)
+        btn_ai_cfg.clicked.connect(self._open_ai_settings)
 
         grp_ai_layout.addSpacing(4)
         grp_ai_layout.addWidget(self.chk_ai)
         grp_ai_layout.addSpacing(8)
         grp_ai_layout.addWidget(self.chk_all)
         grp_ai_layout.addSpacing(4)
-        grp_ai_layout.addWidget(lbl_claude)
-        grp_ai_layout.addWidget(self.edit_claude)
+        grp_ai_layout.addWidget(self.lbl_ai_provider)
+        grp_ai_layout.addWidget(btn_ai_cfg)
         layout.addWidget(grp_ai)
 
         layout.addSpacing(16)
@@ -2476,19 +3082,20 @@ class MainWindow(QMainWindow):
         self.spin_quote.setValue(self.config.get("quote_refresh_secs", 30))
         self.edit_excel.setText(self.config.get("excel_path", DEFAULTS["excel_path"]))
         self.chk_all.setChecked(self.config.get("analyze_all", True))
-        claude = self.config.get("claude_bin", "") or ConfigManager.detect_claude_bin()
-        self.edit_claude.setText(claude)
+        self.lbl_ai_provider.setText(self._get_provider_display())
 
     def _collect_config(self) -> dict:
         cfg = dict(self.config)
-        cfg["interval_min"]        = self.spin_interval.value()
-        cfg["scroll_times"]        = self.spin_scroll.value()
-        cfg["wait_timeout"]        = self.spin_timeout.value()
-        cfg["quote_refresh_secs"]  = self.spin_quote.value()
-        cfg["excel_path"]    = self.edit_excel.text().strip()
-        cfg["analyze_all"]   = self.chk_all.isChecked()
-        cfg["claude_bin"]    = self.edit_claude.text().strip()
-        cfg["chrome_bin"]    = DEFAULTS["chrome_bin"]
+        cfg["interval_min"]       = self.spin_interval.value()
+        cfg["scroll_times"]       = self.spin_scroll.value()
+        cfg["wait_timeout"]       = self.spin_timeout.value()
+        cfg["quote_refresh_secs"] = self.spin_quote.value()
+        cfg["excel_path"]         = self.edit_excel.text().strip()
+        cfg["analyze_all"]        = self.chk_all.isChecked()
+        cfg["chrome_bin"]         = DEFAULTS["chrome_bin"]
+        # AI 配置字段由 AISettingsDialog 管理，这里直接透传 self.config 中的值
+        for key in ("ai_provider", "ai_api_key", "ai_model", "ai_base_url", "claude_bin"):
+            cfg.setdefault(key, self.config.get(key, DEFAULTS.get(key, "")))
         return cfg
 
     # ── 状态更新 ──────────────────────────
@@ -2530,49 +3137,68 @@ class MainWindow(QMainWindow):
     # ── 信号处理 ──────────────────────────
 
     def _on_log_message(self, text: str, level: str):
-        cursor = self.log_edit.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        try:
+            cursor = self.log_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        fmt = QTextCharFormat()
-        if level == "good":
-            fmt.setForeground(QColor(COLOR_GREEN))
-        elif level == "error":
-            fmt.setForeground(QColor(COLOR_RED))
-        else:
-            fmt.setForeground(QColor(COLOR_TEXT))
+            fmt = QTextCharFormat()
+            if level == "good":
+                fmt.setForeground(QColor(COLOR_GREEN))
+            elif level == "error":
+                fmt.setForeground(QColor(COLOR_RED))
+            else:
+                fmt.setForeground(QColor(COLOR_TEXT))
 
-        cursor.setCharFormat(fmt)
-        cursor.insertText(text + "\n")
-        self.log_edit.setTextCursor(cursor)
-        self.log_edit.ensureCursorVisible()
+            cursor.setCharFormat(fmt)
+            cursor.insertText(text + "\n")
+            self.log_edit.setTextCursor(cursor)
+            self.log_edit.ensureCursorVisible()
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def _on_new_data(self, rows: list):
-        # 关闭排序，批量插入后再重新排序（避免插入中途乱序）
-        self.table.setSortingEnabled(False)
-        for row_dict in rows:
-            self._insert_table_row(row_dict)
-        self.table.setSortingEnabled(True)
-        self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
-        self.tabs.setCurrentIndex(1)
+        try:
+            # 关闭排序，批量插入后再重新排序（避免插入中途乱序）
+            self.table.setSortingEnabled(False)
+            for row_dict in rows:
+                self._insert_table_row(row_dict)
+            self.table.setSortingEnabled(True)
+            self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+            self.tabs.setCurrentIndex(1)
+        except Exception:
+            import traceback; traceback.print_exc()
         # 同步到桌面小组件
-        self._desktop_widget.update_news(rows)
+        try:
+            self._desktop_widget.update_news(rows)
+        except Exception:
+            import traceback; traceback.print_exc()
+
+    @staticmethod
+    def _sv(v) -> str:
+        """安全转字符串，处理 pandas NaN（float）"""
+        if v is None:
+            return ""
+        if isinstance(v, float) and v != v:   # NaN != NaN
+            return ""
+        return str(v)
 
     def _insert_table_row(self, row_dict: dict):
+        sv = self._sv
         self.table.insertRow(0)
-        stocks_text = row_dict.get("相关股票", "")
+        stocks_text = sv(row_dict.get("相关股票", ""))
         data = [
-            row_dict.get("发布时间", ""),
-            (row_dict.get("标题", "") or "") + (row_dict.get("内容", "") or "")[:60],
+            sv(row_dict.get("发布时间", "")),
+            (sv(row_dict.get("标题", "")) + sv(row_dict.get("内容", "")))[:80],
             stocks_text,
-            row_dict.get("股票代码", ""),
-            row_dict.get("AI分析", ""),
+            sv(row_dict.get("股票代码", "")),
+            sv(row_dict.get("AI分析", "")),
         ]
-        has_bullish = "↑" in (stocks_text or "")
-        has_bearish = "↓" in (stocks_text or "")
+        has_bullish = "↑" in stocks_text
+        has_bearish = "↓" in stocks_text
         no_relevant = stocks_text == "无相关股票" or not stocks_text
 
         for col, val in enumerate(data):
-            item = QTableWidgetItem(str(val) if val else "")
+            item = QTableWidgetItem(sv(val))
             if col == 2:
                 if no_relevant:
                     item.setForeground(QColor(COLOR_MUTED))
@@ -2756,6 +3382,23 @@ class MainWindow(QMainWindow):
         """小组件被用户关闭时，同步按钮状态"""
         self.btn_widget.setChecked(False)
 
+    # ── AI 设置 ────────────────────────────
+
+    def _get_provider_display(self) -> str:
+        provider = self.config.get("ai_provider", "claude_cli")
+        labels = dict(AISettingsDialog.PROVIDERS)
+        name = labels.get(provider, provider)
+        return f"当前: {name}"
+
+    def _open_ai_settings(self):
+        dlg = AISettingsDialog(self.config, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_cfg = dlg.get_config()
+            self.config.update(new_cfg)
+            ConfigManager.save(self.config)
+            self.lbl_ai_provider.setText(self._get_provider_display())
+            self.status_bar.showMessage("AI 设置已保存", 2000)
+
     # ── 关闭事件 ──────────────────────────
 
     def closeEvent(self, event):
@@ -2777,8 +3420,22 @@ class MainWindow(QMainWindow):
 
 def main():
     import sys
+    import traceback as _tb
+
+    # PyQt6 默认在 slot 中抛出未捕获异常时调用 abort()。
+    # 设置 sys.excepthook 后 PyQt6 6.x 会改为记录异常并继续运行，防止闪退。
+    def _safe_excepthook(exc_type, exc_val, exc_tb):
+        if issubclass(exc_type, (SystemExit, KeyboardInterrupt)):
+            sys.__excepthook__(exc_type, exc_val, exc_tb)
+            return
+        _tb.print_exception(exc_type, exc_val, exc_tb)
+
+    sys.excepthook = _safe_excepthook
+
     app = QApplication(sys.argv)
     app.setApplicationName("财联社监控")
+    from PyQt6.QtGui import QIcon
+    app.setWindowIcon(QIcon(_make_radar_logo(256, dock=True)))
 
     # 高分辨率支持
     try:
