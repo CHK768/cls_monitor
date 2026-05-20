@@ -9,6 +9,7 @@
 打包:
     pyinstaller --onefile --windowed --name "财联社监控" cls_app.py
 """
+from __future__ import annotations
 
 import os
 import re
@@ -350,6 +351,12 @@ def fetch_items(driver: webdriver.Chrome, config: dict, log_fn=None) -> list[dic
 def _analyze_with_claude_cli(news_text: str, config: dict, log_fn=None) -> dict | None:
     """使用 Claude CLI 分析新闻"""
     claude_bin = config.get("claude_bin", "") or "claude"
+    # 配置路径不存在时自动探测
+    if not Path(claude_bin).is_file():
+        fallback = ConfigManager.detect_claude_bin()
+        if log_fn and claude_bin != "claude":
+            log_fn(f"[{now()}] claude 路径 {claude_bin} 不存在，改用 {fallback}", "error")
+        claude_bin = fallback
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
 
@@ -391,8 +398,51 @@ def _analyze_with_claude_cli(news_text: str, config: dict, log_fn=None) -> dict 
         return None
 
 
+def _analyze_with_kiro_cli(news_text: str, config: dict, log_fn=None) -> dict | None:
+    """使用 kiro-cli chat --no-interactive 分析新闻"""
+    kiro_bin = shutil.which("kiro-cli") or "/Users/10259879/.local/bin/kiro-cli"
+    prompt = AI_PROMPT + "\n\n" + news_text
+    env = os.environ.copy()
+    try:
+        result = subprocess.run(
+            [kiro_bin, "chat", "--no-interactive", "--trust-tools="],
+            input=prompt,
+            capture_output=True, text=True, timeout=90, env=env,
+        )
+        if result.returncode != 0:
+            if log_fn:
+                log_fn(f"[{now()}] kiro-cli 错误: {result.stderr[:100]}", "error")
+            return None
+        # 清理 ANSI 转义码
+        raw = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).strip()
+        # 逐行查找第一个以 { 开头的完整 JSON 对象
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        # fallback: 正则提取
+        json_match = re.search(r"\{[^{}]*\"stocks\"[^{}]*\[[\s\S]*?\]\s*,\s*\"summary\"[^{}]*\}", raw)
+        if json_match:
+            return json.loads(json_match.group())
+        if log_fn:
+            log_fn(f"[{now()}] kiro-cli 未返回有效 JSON: {raw[:150]}", "error")
+        return None
+    except subprocess.TimeoutExpired:
+        if log_fn:
+            log_fn(f"[{now()}] kiro-cli 超时，跳过", "error")
+        return None
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[{now()}] kiro-cli 异常: {e}", "error")
+        return None
+
+
 # AI 提供商默认参数
 _AI_PROVIDER_DEFAULTS = {
+    "kiro_cli":    {"base_url": "",                                                   "model": ""},
     "claude_cli":  {"base_url": "",                                                   "model": ""},
     "claude_api":  {"base_url": "https://api.anthropic.com",                          "model": "claude-3-5-sonnet-20241022"},
     "openai":      {"base_url": "https://api.openai.com/v1",                          "model": "gpt-4o-mini"},
@@ -525,7 +575,9 @@ def analyze_news(title: str, body: str, config: dict, log_fn=None) -> dict | Non
         return None
 
     provider = config.get("ai_provider", "claude_cli")
-    if provider == "claude_cli":
+    if provider == "kiro_cli":
+        return _analyze_with_kiro_cli(news_text, config, log_fn)
+    elif provider == "claude_cli":
         return _analyze_with_claude_cli(news_text, config, log_fn)
     else:
         return _analyze_with_api(news_text, config, log_fn)
@@ -655,7 +707,8 @@ def enrich_with_ai(df: pd.DataFrame, config: dict, log_fn=None, row_fn=None, emi
             if emit_ids is None or updated.get("ID") in emit_ids:
                 row_fn([updated])
 
-        time.sleep(22)   # KIMI 免费版约 3 RPM，需 ~20s 间隔
+        if config.get("ai_provider", "claude_cli") not in ("claude_cli", "kiro_cli"):
+            time.sleep(22)   # KIMI 免费版约 3 RPM，需 ~20s 间隔
 
     return df
 
@@ -963,20 +1016,23 @@ class IntradayFetchThread(QThread):
                     time_str = parts[0].split(" ", 1)[-1]   # "09:30"
                     price    = float(parts[1])
                     volume   = int(float(parts[5]))
-                    items.append({"time": time_str, "price": price, "volume": volume})
+                    amount   = float(parts[6]) if len(parts) > 6 else 0.0  # f57 逐分钟成交额
+                    api_avg  = float(parts[7]) if len(parts) > 7 else 0.0  # f58 东财预算均价
+                    items.append({"time": time_str, "price": price, "volume": volume,
+                                  "amount": amount, "api_avg": api_avg})
                 except (ValueError, IndexError):
                     continue
 
-            # 东财指数的成交量字段是累计量，需差分还原为逐分钟量
+            # 东财指数的成交量/成交额字段是累计量，需差分还原为逐分钟量
             if len(items) > 2:
                 vols = [d["volume"] for d in items]
                 # 若超过一半的相邻值是递增的，认为是累计量
                 inc = sum(1 for i in range(1, len(vols)) if vols[i] >= vols[i-1])
                 if inc > len(vols) * 0.6:
-                    prev = 0
+                    prev_v, prev_a = 0, 0.0
                     for d in items:
-                        d["volume"], prev = d["volume"] - prev, d["volume"]
-                        d["volume"] = max(0, d["volume"])
+                        d["volume"], prev_v = max(0, d["volume"] - prev_v), d["volume"]
+                        d["amount"], prev_a = max(0.0, d["amount"] - prev_a), d["amount"]
 
             return items, pre_price
         except Exception:
@@ -1037,6 +1093,50 @@ def _calc_macd(prices: list, fast: int = 6, slow: int = 13, signal: int = 5):
     dea  = _ema(dif, signal)
     hist = [2 * (d - e) for d, e in zip(dif, dea)]
     return dif, dea, hist
+
+
+def _time_to_pos(t: str) -> int | None:
+    """'HH:MM' → 交易分钟坐标 (0=09:30 … 239=14:59, 240=15:00)；非交易时段返回 None。"""
+    try:
+        h, m = int(t[:2]), int(t[3:])
+        mins = h * 60 + m
+        if 570 <= mins <= 690:    # 09:30-11:30
+            return mins - 570
+        if 780 <= mins <= 900:    # 13:00-15:00
+            return 120 + (mins - 780)
+        return None
+    except Exception:
+        return None
+
+
+def _build_vwap(items: list) -> list:
+    """
+    构建与同花顺一致的分时均价序列（长度同 items）。
+    优先使用 API 直接提供的 api_avg（东财 f58），
+    否则用逐分钟成交额 amount 累计除以成交量，
+    最后退回 price×volume 近似值。
+    """
+    n = len(items)
+    result = [0.0] * n
+    cum_amount = 0.0
+    cum_vol    = 0.0
+    for i, d in enumerate(items):
+        # API 直接给了均价：直接用（跳过累计计算）
+        if d.get("api_avg", 0.0) > 0:
+            result[i] = d["api_avg"]
+            continue
+        # 用实际成交额累计
+        if _time_to_pos(d["time"]) is not None:
+            amt = d.get("amount", 0.0)
+            vol = d.get("volume", 0)
+            if amt > 0:
+                cum_amount += amt
+                cum_vol    += vol
+            else:
+                cum_amount += d["price"] * vol
+                cum_vol    += vol
+        result[i] = cum_amount / cum_vol if cum_vol else d["price"]
+    return result
 
 
 # ──────────────────────────────────────────
@@ -1104,21 +1204,19 @@ class MultiStockScanner(QThread):
 
         prices = [d["price"] for d in items]
         dif, dea, _ = _calc_macd(prices)
-
-        cum_pv  = [0.0] * (n + 1)
-        cum_vol = [0.0] * (n + 1)
-        for i, d in enumerate(items):
-            cum_pv[i+1]  = cum_pv[i]  + d["price"] * d["volume"]
-            cum_vol[i+1] = cum_vol[i] + d["volume"]
+        vwap = _build_vwap(items)
 
         scan_start = max(start, 14)
         for i in range(scan_start, n):
             d         = items[i]
             cur_price = d["price"]
-            avg_price = cum_pv[i+1] / cum_vol[i+1] if cum_vol[i+1] else cur_price
+            avg_price = vwap[i]
 
             golden = dif[i-1] <= dea[i-1] and dif[i] > dea[i]
             death  = dif[i-1] >= dea[i-1] and dif[i] < dea[i]
+
+            if _time_to_pos(d["time"]) is None:
+                continue
 
             if golden and dea[i] < 0 and cur_price < avg_price:
                 if i - last_buy_idx >= self._MIN_GAP:
@@ -1391,20 +1489,6 @@ class IntradayMonitorTab(QWidget):
         (240, "15:00"),
     ]
 
-    @staticmethod
-    def _time_to_pos(t: str) -> int | None:
-        """'HH:MM' → 交易分钟坐标 (0=09:30 … 239=14:59, 240=15:00)"""
-        try:
-            h, m = int(t[:2]), int(t[3:])
-            mins = h * 60 + m
-            if 570 <= mins <= 690:      # 09:30-11:30
-                return mins - 570
-            if 780 <= mins <= 900:      # 13:00-15:00
-                return 120 + (mins - 780)
-            return None
-        except Exception:
-            return None
-
     def _draw_chart(self):
         import matplotlib.ticker as mticker
 
@@ -1412,25 +1496,18 @@ class IntradayMonitorTab(QWidget):
         if not items:
             return
 
-        xs, prices, volumes = [], [], []
-        for d in items:
-            pos = self._time_to_pos(d["time"])
+        vwap_all = _build_vwap(items)
+        xs, prices, avg_prices = [], [], []
+        for d, vw in zip(items, vwap_all):
+            pos = _time_to_pos(d["time"])
             if pos is None:
                 continue
             xs.append(pos)
             prices.append(d["price"])
-            volumes.append(d["volume"])
+            avg_prices.append(vw)
 
         if not xs:
             return
-
-        n = len(prices)
-        cum_pv, cum_vol = 0.0, 0.0
-        avg_prices = []
-        for p, v in zip(prices, volumes):
-            cum_pv  += p * v
-            cum_vol += v
-            avg_prices.append(cum_pv / cum_vol if cum_vol else p)
 
         ax_p = self._ax_price
         ax_r = self._ax_pct
@@ -1553,12 +1630,7 @@ class IntradayMonitorTab(QWidget):
 
         prices = [d["price"] for d in items]
         dif, dea, _ = _calc_macd(prices)
-
-        cum_pv  = [0.0] * (n + 1)
-        cum_vol = [0.0] * (n + 1)
-        for i, d in enumerate(items):
-            cum_pv[i+1]  = cum_pv[i]  + d["price"] * d["volume"]
-            cum_vol[i+1] = cum_vol[i] + d["volume"]
+        vwap = _build_vwap(items)
 
         last_buy_idx  = -self._MIN_GAP
         last_sell_idx = -self._MIN_GAP
@@ -1574,12 +1646,12 @@ class IntradayMonitorTab(QWidget):
         for i in range(scan_start, end):
             d         = items[i]
             cur_price = d["price"]
-            avg_price = cum_pv[i+1] / cum_vol[i+1] if cum_vol[i+1] else cur_price
+            avg_price = vwap[i]
 
             golden = dif[i-1] <= dea[i-1] and dif[i] > dea[i]
             death  = dif[i-1] >= dea[i-1] and dif[i] < dea[i]
 
-            pos = self._time_to_pos(d["time"])
+            pos = _time_to_pos(d["time"])
             if pos is None:
                 continue
 
@@ -2009,6 +2081,7 @@ class AISettingsDialog(QDialog):
     """AI 提供商配置对话框，支持 Claude CLI / Claude API / ChatGPT / Gemini / KIMI / QWen / 自定义"""
 
     PROVIDERS = [
+        ("kiro_cli",   "Kiro CLI（本地命令行）"),
         ("claude_cli", "Claude CLI（本地命令行）"),
         ("claude_api", "Claude API（Anthropic）"),
         ("openai",     "ChatGPT / OpenAI"),
@@ -2221,9 +2294,9 @@ class AISettingsDialog(QDialog):
         self.adjustSize()
 
     def _update_visibility(self, provider: str):
-        is_cli = (provider == "claude_cli")
+        is_cli = (provider in ("claude_cli", "kiro_cli"))
         show_base_url = provider in ("claude_api", "custom")
-        self.row_claude_bin.setVisible(is_cli)
+        self.row_claude_bin.setVisible(provider == "claude_cli")
         self.row_api_key.setVisible(not is_cli)
         self.row_model.setVisible(not is_cli)
         self.row_base_url.setVisible(show_base_url)
@@ -2899,8 +2972,8 @@ class DesktopWidget(QWidget):
     _C_TITLE  = "rgba(255, 255, 255, 18)"  # 淡白标题栏
     _C_BORDER = "rgba(255, 255, 255, 30)"  # 微白边框
     _C_SEP    = "rgba(255, 255, 255, 20)"  # 分隔线
-    _C_TEXT   = "rgba(235, 238, 245, 230)" # 正文
-    _C_MUTED  = "rgba(160, 168, 185, 200)" # 次要文字
+    _C_TEXT   = "#ebeff5"                     # 正文（实色，毛玻璃下 rgba 会不可见）
+    _C_MUTED  = "#a0a8b9"                     # 次要文字
     _C_GREEN  = "#34d399"                  # A股绿跌
     _C_RED    = "#f87171"                  # A股红涨
     _C_AMBER  = "#fbbf24"
@@ -3068,16 +3141,9 @@ class DesktopWidget(QWidget):
     def update_news(self, rows: list[dict]):
         existing_ids = {r.get("ID") for r in self._news_items}
         for row in rows:
-            if row.get("相关股票") and row.get("ID") not in existing_ids:
-                self._news_items.append(row)
+            if row.get("ID") not in existing_ids:
+                self._news_items.insert(0, row)
                 existing_ids.add(row.get("ID"))
-        # 按发布时间降序，确保最新的始终在最上面
-        try:
-            self._news_items.sort(
-                key=lambda r: str(r.get("发布时间", "")), reverse=True
-            )
-        except Exception:
-            pass
         self._news_items = self._news_items[:8]
         self._refresh_news_label()
 
@@ -3115,10 +3181,16 @@ class DesktopWidget(QWidget):
         lines = []
         for item in self._news_items[:6]:
             stocks = item.get("相关股票", "")
-            _t = item.get("标题") or item.get("内容") or ""
-            title  = str(_t)[:28] if _t == _t else ""  # guard against NaN
+            if isinstance(stocks, float):
+                stocks = ""
+            _t = item.get("标题", "") or item.get("内容", "")
+            if isinstance(_t, float):
+                _t = ""
+            title  = str(_t)[:30] if _t else ""
             raw_t  = item.get("发布时间", "")
-            _rt = str(raw_t) if raw_t and raw_t == raw_t else ""
+            if isinstance(raw_t, float):
+                raw_t = ""
+            _rt = str(raw_t) if raw_t else ""
             _m  = re.search(r"(\d{2}:\d{2})", _rt)
             t_str = _m.group(1) if _m else ""
 
@@ -3381,6 +3453,23 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_config_to_ui()
         self._update_status(False)
+        self._load_excel_to_table()
+
+    def _load_excel_to_table(self):
+        """启动时从 Excel 加载历史数据到表格"""
+        excel_path = Path(self.config.get("excel_path", DEFAULTS["excel_path"]))
+        if not excel_path.exists():
+            return
+        try:
+            df = pd.read_excel(excel_path, dtype=str)
+            if df.empty:
+                return
+            if "发布时间" in df.columns:
+                df.sort_values("发布时间", ascending=False, inplace=True, ignore_index=True)
+            rows = df.to_dict(orient="records")
+            self._on_new_data(rows)
+        except Exception:
+            pass
 
     # ── UI 构建 ────────────────────────────
 
@@ -4074,8 +4163,6 @@ class MainWindow(QMainWindow):
                 inserted.append(row_dict)
             self.table.setSortingEnabled(True)
             self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
-            if inserted:
-                self.tabs.setCurrentIndex(1)
         except Exception:
             import traceback; traceback.print_exc()
         # 同步到桌面小组件（仅真正新插入的）
@@ -4124,6 +4211,8 @@ class MainWindow(QMainWindow):
 
         # 最后一列：添加到报价栏按钮（有股票代码时才显示）
         codes_raw = row_dict.get("股票代码", "")
+        if isinstance(codes_raw, float):
+            codes_raw = ""
         codes = [c.strip() for c in codes_raw.split("\n") if c.strip()] if codes_raw else []
         if codes:
             btn = _AddButton()
