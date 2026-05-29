@@ -928,7 +928,7 @@ class QuoteFetchThread(QThread):
             results.sort(key=lambda x: order.get(x["code"], 999))
             self.quotes_ready.emit(results)
         except Exception:
-            pass
+            import traceback; traceback.print_exc()
 
 
 # ──────────────────────────────────────────
@@ -3215,15 +3215,8 @@ class DesktopWidget(QWidget):
         existing_ids = {r.get("ID") for r in self._news_items}
         for row in rows:
             if row.get("ID") not in existing_ids:
-                self._news_items.append(row)
+                self._news_items.insert(0, row)
                 existing_ids.add(row.get("ID"))
-        # 按发布时间降序，最新的在最上面
-        try:
-            self._news_items.sort(
-                key=lambda r: str(r.get("发布时间", "")), reverse=True
-            )
-        except Exception:
-            pass
         self._news_items = self._news_items[:8]
         self._refresh_news_label()
 
@@ -3549,7 +3542,7 @@ class MainWindow(QMainWindow):
             rows = df.to_dict(orient="records")
             self._on_new_data(rows)
         except Exception:
-            pass
+            import traceback; traceback.print_exc()
 
     # ── UI 构建 ────────────────────────────
 
@@ -4233,7 +4226,7 @@ class MainWindow(QMainWindow):
         inserted = []
         try:
             self.table.setSortingEnabled(False)
-            for row_dict in rows:
+            for row_dict in reversed(rows):
                 rid = str(row_dict.get("ID", ""))
                 if rid and rid in self._table_ids:
                     continue
