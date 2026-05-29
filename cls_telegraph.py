@@ -9,12 +9,15 @@
     python3 cls_telegraph.py
 """
 
+from __future__ import annotations
+
 import os
 import re
 import json
 import time
 import subprocess
 import schedule
+import requests
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +34,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 # 配置
 # ──────────────────────────────────────────
 URL          = "https://www.cls.cn/telegraph"
+API_URL      = "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraphList&os=web&sv=8.7.9"
+API_HEADERS  = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://www.cls.cn/telegraph",
+}
 EXCEL_PATH   = Path.home() / "Desktop" / "cls_telegraph.xlsx"
 INTERVAL_MIN = 5
 SCROLL_TIMES = 3
@@ -147,7 +155,62 @@ def build_driver() -> webdriver.Chrome:
 # 抓取 & 解析
 # ──────────────────────────────────────────
 
-def fetch_items(driver: webdriver.Chrome) -> list[dict]:
+# ──────────────────────────────────────────
+# API 抓取（优先使用，比 Selenium 更稳定）
+# ──────────────────────────────────────────
+
+def _fetch_telegraph_api() -> list[dict]:
+    """通过 API 获取电报数据"""
+    try:
+        r = requests.get(API_URL, headers=API_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("errno") != 0:
+            print(f"[{now()}] API 返回错误: errno={data.get('errno')}")
+            return []
+        roll_data = data.get("data", {}).get("roll_data", [])
+        if not roll_data:
+            return []
+        return _parse_api_items(roll_data)
+    except requests.RequestException as e:
+        print(f"[{now()}] API 请求失败: {e}")
+    except Exception as e:
+        print(f"[{now()}] API 解析失败: {e}")
+    return []
+
+
+def _parse_api_items(roll_data: list) -> list[dict]:
+    """将 API 返回的 roll_data 转换为兼容格式"""
+    results = []
+    for item in roll_data:
+        ctime = item.get("ctime", 0)
+        pub_time = datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S") if ctime else ""
+        brief = item.get("brief", "") or item.get("content", "") or ""
+        content = item.get("content", "") or brief
+
+        m = re.match(r"^(【[^】]+】)(.*)", brief, re.DOTALL)
+        title = m.group(1) if m else (item.get("title", "") or "")
+        body = m.group(2).strip() if m else brief
+
+        uid = str(item.get("id", f"{pub_time}_{brief[:20]}"))
+        results.append({
+            "ID": uid, "发布时间": pub_time, "标题": title, "内容": body,
+            "抓取时间": now(),
+            "利好股票": "", "股票代码": "", "AI分析": "", "AI分析时间": "",
+        })
+    return results
+
+
+def fetch_items(driver: webdriver.Chrome | None) -> list[dict]:
+    """获取电报数据 — 优先使用 API，失败时降级为 Selenium"""
+    items = _fetch_telegraph_api()
+    if items:
+        print(f"[{now()}] API 获取到 {len(items)} 条电报")
+        return items
+
+    print(f"[{now()}] API 失败，降级为网页抓取...")
+    if driver is None:
+        return []
     driver.get(URL)
     try:
         WebDriverWait(driver, WAIT_TIMEOUT).until(
@@ -287,10 +350,15 @@ def job():
     print(f"\n[{now()}] ── 开始抓取 ──")
     driver = None
     try:
-        driver    = build_driver()
-        new_items = fetch_items(driver)
-        driver.quit()
-        driver    = None
+        # 优先 API 抓取（无需 driver）
+        new_items = fetch_items(None)
+        if not new_items:
+            # API 失败，创建 driver 降级到 Selenium
+            driver    = build_driver()
+            new_items = fetch_items(driver)
+        if driver:
+            driver.quit()
+            driver    = None
 
         if not new_items:
             print(f"[{now()}] 未获取到数据")

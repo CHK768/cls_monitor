@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -48,6 +49,11 @@ from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor, QClipboard,
 # ──────────────────────────────────────────
 
 URL = "https://www.cls.cn/telegraph"
+API_URL = "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraphList&os=web&sv=8.7.9"
+API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://www.cls.cn/telegraph",
+}
 
 
 class _RateLimitError(Exception):
@@ -274,6 +280,55 @@ def _get_chromedriver() -> str:
     raise RuntimeError("未找到可用的 chromedriver，请检查 Chrome 安装或网络连接")
 
 
+# ──────────────────────────────────────────
+# API 抓取（优先使用，比 Selenium 更稳定）
+# ──────────────────────────────────────────
+
+def _fetch_telegraph_api(log_fn=None) -> list[dict]:
+    """通过 API 获取电报数据，返回与 parse_page 相同格式的 list[dict]"""
+    try:
+        r = requests.get(API_URL, headers=API_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("errno") != 0:
+            if log_fn:
+                log_fn(f"[{now()}] API 返回错误: errno={data.get('errno')}", "error")
+            return []
+        roll_data = data.get("data", {}).get("roll_data", [])
+        if not roll_data:
+            return []
+        return _parse_api_items(roll_data)
+    except requests.RequestException as e:
+        if log_fn:
+            log_fn(f"[{now()}] API 请求失败: {e}", "error")
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[{now()}] API 解析失败: {e}", "error")
+    return []
+
+
+def _parse_api_items(roll_data: list) -> list[dict]:
+    """将 API 返回的 roll_data 转换为与 parse_page 兼容的格式"""
+    results = []
+    for item in roll_data:
+        ctime = item.get("ctime", 0)
+        pub_time = datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S") if ctime else ""
+        brief = item.get("brief", "") or item.get("content", "") or ""
+        content = item.get("content", "") or brief
+
+        m = re.match(r"^(【[^】]+】)(.*)", brief, re.DOTALL)
+        title = m.group(1) if m else (item.get("title", "") or "")
+        body = m.group(2).strip() if m else brief
+
+        uid = str(item.get("id", f"{pub_time}_{brief[:20]}"))
+        results.append({
+            "ID": uid, "发布时间": pub_time, "标题": title, "内容": body,
+            "抓取时间": now(),
+            "相关股票": "", "股票代码": "", "AI分析": "", "AI分析时间": "",
+        })
+    return results
+
+
 def parse_page(driver: webdriver.Chrome, log_fn=None) -> list[dict]:
     results = []
     today = datetime.now().strftime("%Y-%m-%d")
@@ -329,7 +384,20 @@ def parse_page(driver: webdriver.Chrome, log_fn=None) -> list[dict]:
     return results
 
 
-def fetch_items(driver: webdriver.Chrome, config: dict, log_fn=None) -> list[dict]:
+def fetch_items(driver: webdriver.Chrome | None, config: dict, log_fn=None) -> list[dict]:
+    """获取电报数据 — 优先使用 API，失败时降级为 Selenium 网页抓取"""
+    # 优先尝试 API
+    items = _fetch_telegraph_api(log_fn)
+    if items:
+        if log_fn:
+            log_fn(f"[{now()}] API 获取到 {len(items)} 条电报", "normal")
+        return items
+
+    # API 失败，降级为 Selenium 抓取
+    if log_fn:
+        log_fn(f"[{now()}] API 失败，降级为网页抓取...", "error")
+    if driver is None:
+        return []
     driver.get(URL)
     wait_timeout = config.get("wait_timeout", 20)
     scroll_times = config.get("scroll_times", 3)
@@ -722,10 +790,15 @@ def job(config: dict, log_fn=None, row_fn=None):
     added = 0
     total = 0
     try:
-        driver = build_driver(config)
-        new_items = fetch_items(driver, config, log_fn)
-        driver.quit()
-        driver = None
+        # 优先 API 抓取（无需 driver）
+        new_items = fetch_items(None, config, log_fn)
+        if not new_items:
+            # API 失败，创建 driver 降级到 Selenium
+            driver = build_driver(config)
+            new_items = fetch_items(driver, config, log_fn)
+        if driver:
+            driver.quit()
+            driver = None
 
         if not new_items:
             if log_fn:
@@ -3142,8 +3215,15 @@ class DesktopWidget(QWidget):
         existing_ids = {r.get("ID") for r in self._news_items}
         for row in rows:
             if row.get("ID") not in existing_ids:
-                self._news_items.insert(0, row)
+                self._news_items.append(row)
                 existing_ids.add(row.get("ID"))
+        # 按发布时间降序，最新的在最上面
+        try:
+            self._news_items.sort(
+                key=lambda r: str(r.get("发布时间", "")), reverse=True
+            )
+        except Exception:
+            pass
         self._news_items = self._news_items[:8]
         self._refresh_news_label()
 
